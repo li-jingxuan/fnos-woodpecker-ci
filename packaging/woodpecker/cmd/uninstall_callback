@@ -1,0 +1,3 @@
+#!/bin/sh
+set -- uninstall
+. "$(dirname -- "$0")/common"

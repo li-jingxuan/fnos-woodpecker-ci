@@ -1,0 +1,50 @@
+[
+  {
+    "stepTitle": "Woodpecker CI 停机配置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "先停止接收任务并确认任务排空，再通过应用中心停止应用后提交配置。固定前缀 /app/woodpecker。修改后必须通过应用中心重新启动并确认容器重建，普通 restart 不保证读取新 env_file 或挂载；若平台未重建，请联系维护者。地址变化须同步 GitHub OAuth callback 和既有仓库 Webhook。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_page_origin",
+        "label": "页面 HTTPS origin（不含 /app/woodpecker）",
+        "rules": [
+          {"required": true, "message": "请输入实际 HTTPS 页面 origin"},
+          {"pattern": "^https://[^/?#@\\s]+/?$", "message": "只填写 HTTPS origin，不含路径、凭据或查询参数"}
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_github_admin",
+        "label": "GitHub 管理员用户名（不是飞牛账号）",
+        "rules": [
+          {"required": true, "message": "请输入单个 GitHub 用户名"},
+          {"pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$", "message": "请输入合法的单个 GitHub 用户名"}
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_github_client",
+        "label": "GitHub OAuth Client ID",
+        "rules": [{"required": true, "message": "请输入 OAuth App 的 Client ID"}]
+      },
+      {
+        "type": "password",
+        "field": "wizard_github_secret",
+        "label": "新的 OAuth Client Secret（留空保留现值）"
+      },
+      {
+        "type": "text",
+        "field": "wizard_webhook_origin",
+        "label": "独立 Webhook HTTPS origin（留空使用页面 origin）",
+        "rules": [{"pattern": "^(?:https://[^/?#@\\s]+/?)?$", "message": "留空或填写不含路径的 HTTPS origin"}]
+      },
+      {
+        "type": "tips",
+        "helpText": "Secret 不提供默认值或回填，留空保留已有凭据，不代表清除。Agent 密钥继续复用。FN Connect 匿名 Webhook 和完整流水线仍需独立验收，状态仅检查 Server/网关健康。"
+      }
+    ]
+  }
+]

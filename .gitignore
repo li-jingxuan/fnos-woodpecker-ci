@@ -1,0 +1,21 @@
+# Build output and local tooling scratch files
+/dist/
+*.fpk
+*.sha256
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+
+# Local credentials and runtime data never belong in source control
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.sqlite
+*.sqlite-*
+*.sock
+/local/
+/tmp/
+/.openchamber/

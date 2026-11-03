@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Verify a cold backup and stopped Docker tasks before a package upgrade/uninstall."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import tarfile
+import time
+
+
+BACKUP = runpy.run_path(str(Path(__file__).with_name("backup-data")))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--app-root", default="/var/apps/woodpecker")
+    parser.add_argument("--operation", choices=("upgrade", "uninstall"), required=True)
+    parser.add_argument("--backup", required=True, help="existing external cold backup")
+    args = parser.parse_args()
+    root = Path(args.app_root).resolve(strict=True)
+    etc = (root / "etc").resolve(strict=True)
+    var = (root / "var").resolve(strict=True)
+    # A failed re-verification must not leave an earlier authorization usable.
+    path = etc / ".maintenance.json"
+    path.unlink(missing_ok=True)
+    archive = Path(args.backup).resolve(strict=True)
+    if not archive.is_file() or any(archive.is_relative_to(path) for path in (root, etc, var)):
+        parser.error("backup must be a regular external archive")
+    BACKUP["stopped"]()
+    # Use one descriptor for validation and the permit digest, avoiding path swaps.
+    with archive.open("rb") as source:
+        before = BACKUP["fingerprint"](os.fstat(source.fileno()))
+        with tarfile.open(fileobj=source, mode="r:gz") as handle:
+            manifest = BACKUP["archive_manifest"](handle, BACKUP["safe_members"](handle))
+        source.seek(0)
+        digest = BACKUP["digest"](source)
+        if BACKUP["snapshot"](root, etc, var) != manifest:
+            raise ValueError("backup does not match the current instance and data")
+        if (BACKUP["fingerprint"](os.fstat(source.fileno())) != before
+                or BACKUP["fingerprint"](archive.stat()) != before):
+            raise ValueError("backup changed during verification")
+    BACKUP["stopped"]()
+    revision = manifest["revision"]
+    permit = {"operation": args.operation, "revision": revision, "created": time.time(),
+              "backup_sha256": digest, "no_running_tasks": True}
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        if os.geteuid() == 0:
+            os.fchown(handle.fileno(), etc.stat().st_uid, etc.stat().st_gid)
+        json.dump(permit, handle)
+    print("Maintenance verification recorded for 15 minutes. Keep the app stopped until the operation completes.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, subprocess.CalledProcessError, tarfile.TarError, ValueError, EOFError, RecursionError):
+        raise SystemExit("maintenance verification failed; check application state and trusted backup")

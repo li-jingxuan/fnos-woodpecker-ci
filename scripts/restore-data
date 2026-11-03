@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Extract a trusted backup offline; never start it or mark it production ready.
+
+Files belong to the restoring operator. A supported deployment must initialize
+Server/Agent ownership for its runtime UID before production use.
+"""
+
+import argparse
+import os
+from pathlib import Path
+import runpy
+import shutil
+import tarfile
+
+
+BACKUP = runpy.run_path(str(Path(__file__).with_name("backup-data")))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive", required=True)
+    parser.add_argument("--destination", required=True, help="new offline staging directory")
+    args = parser.parse_args()
+    destination = Path(args.destination).absolute()
+    if destination.exists() or destination.is_symlink():
+        parser.error("destination must not already exist")
+    with tarfile.open(args.archive, "r:gz") as archive:
+        members = BACKUP["safe_members"](archive)
+        if BACKUP["MANIFEST"] in members:
+            BACKUP["archive_manifest"](archive, members)
+        destination.mkdir(mode=0o700, parents=False)
+        try:
+            # Never apply archive ownership or directory modes. Even permissive
+            # source directories remain private, including implicit parents.
+            for name, member in sorted(members.items(), key=lambda item: (item[0].count("/"), item[0])):
+                target = destination / name
+                relative = target.parent.relative_to(destination)
+                parent = destination
+                for part in relative.parts:
+                    parent /= part
+                    parent.mkdir(mode=0o700, exist_ok=True)
+                if member.isdir():
+                    target.mkdir(mode=0o700, exist_ok=True)
+                elif member.isfile():
+                    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(descriptor, "wb") as output, archive.extractfile(member) as source:
+                        shutil.copyfileobj(source, output)
+                        os.fchmod(output.fileno(), 0o600 | (member.mode & 0o100))
+            # Only the validated revision link is created, after all real files.
+            if "etc/current" in members:
+                (destination / "etc/current").symlink_to(members["etc/current"].linkname)
+        except BaseException:
+            shutil.rmtree(destination)
+            raise
+    print("Restored offline with operator ownership; not production ready. Initialize Server/Agent runtime ownership and isolate production credentials before starting.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, tarfile.TarError, ValueError, EOFError, RecursionError):
+        raise SystemExit("restore failed; verify the trusted archive and destination")

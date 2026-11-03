@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Generate the project's original, reproducible application icon (no dependencies)."""
+
+from pathlib import Path
+import struct
+import zlib
+
+
+ROOT = Path(__file__).resolve().parent.parent / "packaging" / "woodpecker"
+
+
+def png(size):
+    points = [(0.18, 0.29), (0.33, 0.72), (0.50, 0.42), (0.67, 0.72), (0.82, 0.29)]
+    rows = []
+    for y in range(size):
+        row = bytearray()
+        for x in range(size):
+            px, py = (x + 0.5) / size, (y + 0.5) / size
+            distance = 1.0
+            for (ax, ay), (bx, by) in zip(points, points[1:]):
+                dx, dy = bx - ax, by - ay
+                t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+                distance = min(distance, ((px - ax - t * dx) ** 2 + (py - ay - t * dy) ** 2) ** 0.5)
+            row.extend((236, 253, 245) if distance < 0.052 else (8, 76, 61))
+        rows.append(b"\0" + row)
+
+    def chunk(kind, value):
+        return struct.pack(">I", len(value)) + kind + value + struct.pack(">I", zlib.crc32(kind + value))
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
+for dimension in (64, 256):
+    content = png(dimension)
+    (ROOT / ("ICON.PNG" if dimension == 64 else "ICON_256.PNG")).write_bytes(content)
+    destination = ROOT / "app" / "ui" / "images" / ("icon_%d.png" % dimension)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)

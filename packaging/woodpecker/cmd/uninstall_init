@@ -1,0 +1,3 @@
+#!/bin/sh
+set -- uninstall-init
+. "$(dirname -- "$0")/common"

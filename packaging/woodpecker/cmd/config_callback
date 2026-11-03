@@ -1,0 +1,3 @@
+#!/bin/sh
+set -- config
+. "$(dirname -- "$0")/common"

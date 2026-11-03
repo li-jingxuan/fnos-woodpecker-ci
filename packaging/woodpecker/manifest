@@ -1,0 +1,13 @@
+appname=woodpecker
+version=0.1.1
+display_name=Woodpecker CI
+desc=通过飞牛统一网关访问的 Woodpecker CI，支持 GitHub 与单 Agent Docker 构建。
+source=thirdparty
+platform=x86
+maintainer=li-jingxuan
+maintainer_url=https://github.com/li-jingxuan/fnos-woodpecker-ci
+desktop_uidir=ui
+desktop_applaunchname=woodpecker.main
+checkport=false
+ctl_stop=true
+disable_authorization_path=true

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Build with a locally provided fnpack. Never download or execute a remote tool.
+set -euo pipefail
+umask 077
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_dir="$(cd -- "$script_dir/.." && pwd -P)"
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo 'Usage: scripts/build-fpk [package-directory]'
+    echo 'FN_PACK_BIN selects an installed fnpack executable; output is dist/woodpecker-VERSION.fpk[.sha256].'
+    exit 0
+fi
+if (( $# > 1 )); then
+    echo 'Usage: scripts/build-fpk [package-directory]' >&2
+    exit 2
+fi
+package_dir="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "${1:-$repo_dir/packaging/woodpecker}")"
+python3 "$script_dir/validate-package" "$package_dir"
+
+fnpack="${FN_PACK_BIN:-fnpack}"
+if [[ "$fnpack" == */* ]]; then
+    fnpack="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$fnpack")"
+else
+    fnpack="$(command -v -- "$fnpack")" || {
+        echo 'fnpack not found: install it from the official fnOS SDK, or set FN_PACK_BIN.' >&2
+        exit 1
+    }
+fi
+if [[ ! -f "$fnpack" || ! -x "$fnpack" ]]; then
+    echo 'FN_PACK_BIN must identify an executable file.' >&2
+    exit 1
+fi
+# Resolve PATH entries before changing the working directory.
+fnpack="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$fnpack")"
+stage="$(mktemp -d "${TMPDIR:-/tmp}/woodpecker-fpk.XXXXXX")"
+trap 'rm -rf -- "$stage"' EXIT
+stage="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$stage")"
+python3 - "$package_dir" "$stage/package" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+shutil.copytree(Path(sys.argv[1]), Path(sys.argv[2]))
+bootstrap = Path(sys.argv[2]) / 'cmd' / 'bootstrap'
+bootstrap.mkdir()
+shutil.copy2(Path(sys.argv[2]) / 'app' / 'scripts' / 'runtime.py', bootstrap / 'runtime.py')
+PY
+(
+    cd -- "$stage"
+    "$fnpack" build --directory "$stage/package"
+)
+python3 - "$stage" "$repo_dir/dist" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+stage, dist = map(Path, sys.argv[1:])
+artifacts = [p for p in stage.rglob('*.fpk') if p.is_file() and not p.is_symlink()]
+if len(artifacts) != 1 or artifacts[0].stat().st_size == 0:
+    raise SystemExit('fnpack must produce exactly one nonempty .fpk inside staging')
+dist.mkdir(parents=True, exist_ok=True)
+name = 'woodpecker-0.1.1.fpk'
+with tempfile.TemporaryDirectory(prefix='.woodpecker-build-', dir=dist) as temporary:
+    target = Path(temporary) / name
+    shutil.copyfile(artifacts[0], target)
+    digest = hashlib.sha256()
+    with target.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    checksum = Path(temporary) / (name + '.sha256')
+    checksum.write_text(digest.hexdigest() + '  ' + name + '\n', encoding='ascii')
+    os.replace(target, dist / name)
+    os.replace(checksum, dist / checksum.name)
+print('Built: ' + str(dist / name))
+print('SHA-256: ' + str(dist / (name + '.sha256')))
+PY

@@ -1,0 +1,51 @@
+[
+  {
+    "stepTitle": "Woodpecker CI 初始配置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "固定访问前缀为 /app/woodpecker。origin 只填写 HTTPS 协议、主机名和可选端口，不包含路径。请先准备真实 GitHub OAuth App，callback 为 <页面 origin>/app/woodpecker/authorize。Agent 密钥自动生成；首版仅允许下方 GitHub 管理员及其仓库，并发固定为 1。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_page_origin",
+        "label": "页面 origin（实际 FN Connect HTTPS 域名）",
+        "rules": [
+          {"required": true, "message": "请输入实际 HTTPS 页面 origin"},
+          {"pattern": "^https://[^/?#@\\s]+/?$", "message": "只填写 HTTPS origin，不含路径、凭据或查询参数"}
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_github_admin",
+        "label": "GitHub 管理员用户名（不是飞牛账号）",
+        "rules": [
+          {"required": true, "message": "请输入单个 GitHub 用户名"},
+          {"pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$", "message": "请输入合法的单个 GitHub 用户名"}
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_github_client",
+        "label": "GitHub OAuth Client ID",
+        "rules": [{"required": true, "message": "请输入真实 OAuth App 的 Client ID"}]
+      },
+      {
+        "type": "password",
+        "field": "wizard_github_secret",
+        "label": "GitHub OAuth Client Secret",
+        "rules": [{"required": true, "message": "首次安装必须填写真实 OAuth Client Secret"}]
+      },
+      {
+        "type": "text",
+        "field": "wizard_webhook_origin",
+        "label": "独立 Webhook HTTPS origin（可留空）",
+        "rules": [{"pattern": "^(?:https://[^/?#@\\s]+/?)?$", "message": "留空或填写不含路径的 HTTPS origin"}]
+      },
+      {
+        "type": "tips",
+        "helpText": "Webhook origin 留空时使用页面 origin，仅代表候选配置：FN Connect 的匿名 POST 可达性尚须验证。独立入口仅转发 POST /app/woodpecker/api/hook 并保留查询参数。安装位置建议使用数据卷，应用卷及 Docker 数据卷各至少预留 20 GiB；脚本不会检测 Docker 卷。页面健康不代表 Agent 在线或流水线验证通过。"
+      }
+    ]
+  }
+]

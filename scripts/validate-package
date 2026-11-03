@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Offline fnOS package contract checks. Uses only Python's standard library."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+
+
+PREFIX = "/app/woodpecker"
+COMMANDS = (
+    "main", "install_init", "install_callback", "upgrade_init", "upgrade_callback",
+    "config_init", "config_callback", "uninstall_init", "uninstall_callback",
+)
+REQUIRED = (
+    "manifest", "config/resource", "config/privilege", "wizard/install",
+    "wizard/config", "wizard/uninstall", "app/docker/docker-compose.yaml",
+    "app/scripts/runtime.py", "app/ui/config", "ICON.PNG", "ICON_256.PNG",
+    "app/ui/images/icon_64.png", "app/ui/images/icon_256.png",
+) + tuple("cmd/" + name for name in COMMANDS)
+MANIFEST = {
+    "appname": "woodpecker", "version": "0.1.1", "platform": "x86",
+    "source": "thirdparty", "desktop_uidir": "ui",
+    "desktop_applaunchname": "woodpecker.main", "checkport": "false",
+    "ctl_stop": "true", "disable_authorization_path": "true",
+}
+SENSITIVE_KEY = re.compile(
+    r"(?:WOODPECKER_(?:GITHUB_SECRET|GITHUB_CLIENT|AGENT_SECRET)|"
+    r"github_(?:secret|client)|client_secret|access_token|password)", re.I
+)
+ASSIGNMENT = re.compile(
+    r'''(?im)^\s*["']?([A-Za-z_][\w.-]*)["']?\s*[:=]\s*(.*?)\s*[,;]?\s*$'''
+)
+KNOWN_SECRET = re.compile(
+    r"(?:\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b|"
+    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|"
+    r"[?&]access_token=(?![<{\[$])[A-Za-z0-9_.-]{20,}|"
+    r"https?://[^\s/@:]+:[^\s/@]+@)", re.I
+)
+
+
+def placeholder(value):
+    value = value.strip().rstrip(",;").strip().strip("\"'")
+    return (
+        not value or value in {"null", "None", "false", "true", "{}"}
+        or value.startswith(("$", "<", "REPLACE_", "EXAMPLE_"))
+        or bool(re.fullmatch(r"\*+", value))
+    )
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+class Validator:
+    def __init__(self, root):
+        self.root = root
+        self.errors = []
+
+    def error(self, relative, message):
+        # Never include source lines or input values, which might contain secrets.
+        self.errors.append(str(relative) + ": " + message)
+
+    def read(self, relative):
+        try:
+            return (self.root / relative).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            self.error(relative, "cannot read UTF-8 file")
+            return ""
+
+    def json(self, relative):
+        try:
+            value = json.loads(self.read(relative), object_pairs_hook=unique_object)
+            self.json_credentials(relative, value)
+            return value
+        except (ValueError, RecursionError):
+            self.error(relative, "invalid JSON or duplicate keys")
+            return None
+
+    def json_credentials(self, relative, node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if SENSITIVE_KEY.fullmatch(key) and isinstance(value, str) and not placeholder(value):
+                    self.error(relative, "credential field must be empty or a placeholder")
+                self.json_credentials(relative, value)
+        elif isinstance(node, list):
+            for child in node:
+                self.json_credentials(relative, child)
+
+    def required(self):
+        for relative in REQUIRED:
+            path = self.root / relative
+            if path.is_symlink() or not path.is_file():
+                self.error(relative, "required regular file missing (symlinks forbidden)")
+        for relative in tuple("cmd/" + name for name in COMMANDS) + ("app/scripts/runtime.py",):
+            path = self.root / relative
+            if path.is_file() and not path.stat().st_mode & stat.S_IXUSR:
+                self.error(relative, "owner execute permission required")
+
+    def manifest(self):
+        values = {}
+        for line in self.read("manifest").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, separator, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
+                self.error("manifest", "malformed or duplicate field")
+                continue
+            values[key] = value
+        for key, expected in MANIFEST.items():
+            if values.get(key) != expected:
+                self.error("manifest", key + " missing or does not match fixed package contract")
+        for key in ("display_name", "desc", "maintainer"):
+            if not values.get(key):
+                self.error("manifest", "required field missing: " + key)
+        if "service_port" in values:
+            self.error("manifest", "gateway package must not declare service_port")
+
+    def resources(self):
+        resource = self.json("config/resource")
+        docker = resource.get("docker-project") if isinstance(resource, dict) else None
+        projects = docker.get("projects") if isinstance(docker, dict) else None
+        if projects != [{"name": "woodpecker", "path": "docker"}]:
+            self.error("config/resource", "expected one woodpecker docker project at app/docker")
+        privilege = self.json("config/privilege")
+        if not isinstance(privilege, dict) or privilege.get("defaults") != {"run-as": "root"}:
+            self.error("config/privilege", "defaults.run-as must be root for the validated pre-Compose bootstrap")
+        if isinstance(privilege, dict) and any(privilege.get(key) != "docker-woodpecker" for key in ("username", "groupname")):
+            self.error("config/privilege", "package username and groupname must be docker-woodpecker")
+        ui = self.json("app/ui/config")
+        entries = ui.get(".url") if isinstance(ui, dict) else None
+        entry = entries.get("woodpecker.main") if isinstance(entries, dict) else None
+        if not isinstance(entry, dict):
+            self.error("app/ui/config", "missing woodpecker.main URL entry")
+        else:
+            expected = {"gatewayPrefix": PREFIX, "url": PREFIX, "gatewaySocket": "woodpecker.sock",
+                        "type": "url", "icon": "images/icon_{0}.png", "allUsers": False}
+            for key, value in expected.items():
+                if entry.get(key) != value:
+                    self.error("app/ui/config", key + " does not match fixed gateway contract")
+            if entry.get("control") != {"accessPerm": "readonly"}:
+                self.error("app/ui/config", "entry accessPerm must be readonly")
+        for relative in ("wizard/install", "wizard/config", "wizard/uninstall"):
+            wizard = self.json(relative)
+            if not isinstance(wizard, (dict, list)) or not wizard:
+                self.error(relative, "wizard must be a nonempty JSON object or array")
+            self.wizard_values(relative, wizard)
+
+    def wizard_values(self, relative, node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in {"default", "value"} and isinstance(value, str):
+                    # Inputs for OAuth and generated credentials must ship empty.
+                    name = str(node.get("field", node.get("name", node.get("key", ""))))
+                    if SENSITIVE_KEY.fullmatch(name) and not placeholder(value):
+                        self.error(relative, "credential input contains a populated default")
+                self.wizard_values(relative, value)
+        elif isinstance(node, list):
+            for child in node:
+                self.wizard_values(relative, child)
+
+    def icons(self):
+        for relative, size in (("ICON.PNG", 64), ("ICON_256.PNG", 256),
+                               ("app/ui/images/icon_64.png", 64), ("app/ui/images/icon_256.png", 256)):
+            try:
+                with (self.root / relative).open("rb") as handle:
+                    header = handle.read(33)
+                if len(header) != 33 or header[:8] != b"\x89PNG\r\n\x1a\n":
+                    raise ValueError
+                length, chunk, width, height = struct.unpack(">I4sII", header[8:24])
+                if length != 13 or chunk != b"IHDR" or (width, height) != (size, size):
+                    raise ValueError
+            except (OSError, ValueError, struct.error):
+                self.error(relative, "expected PNG IHDR dimensions " + str(size) + "x" + str(size))
+
+    def sources(self):
+        bash = shutil.which("bash")
+        if not bash:
+            self.error("scripts", "bash is required for syntax checks")
+        for path in sorted(self.root.rglob("*")):
+            relative = path.relative_to(self.root)
+            if path.is_symlink():
+                self.error(relative, "source symlinks are forbidden")
+                continue
+            if not path.is_file():
+                continue
+            if path.suffix.lower() in {".fpk", ".pyc"} or "__pycache__" in relative.parts:
+                self.error(relative, "generated artifacts must not be packaged")
+            if path.suffix.lower() == ".png":
+                continue
+            text = self.read(relative)
+            if KNOWN_SECRET.search(text):
+                self.error(relative, "possible credential or private key detected")
+            for match in ASSIGNMENT.finditer(text):
+                if SENSITIVE_KEY.fullmatch(match[1]) and not placeholder(match[2]):
+                    # Python expressions consume input at runtime; only inspect literals.
+                    if re.fullmatch(r'''["'][^"']*["']''', match[2]) or path.suffix not in {".py"}:
+                        self.error(relative, "credential assignment must be empty or a placeholder")
+            first = text.splitlines()[0] if text else ""
+            if path.suffix == ".py" or (first.startswith("#!") and "python" in first):
+                try:
+                    compile(text, str(path), "exec")
+                except (SyntaxError, ValueError):
+                    self.error(relative, "Python syntax check failed")
+            elif relative.parts[0] == "cmd" or (first.startswith("#!") and re.search(r"\b(?:ba|da|k|z)?sh\b", first)):
+                if not first.startswith("#!"):
+                    self.error(relative, "executable script must have a shebang")
+                if bash:
+                    result = subprocess.run([bash, "-n", str(path)], stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL, check=False)
+                    if result.returncode:
+                        self.error(relative, "bash -n failed")
+                if not path.stat().st_mode & stat.S_IXUSR:
+                    self.error(relative, "shell script must be executable")
+        compose = self.read("app/docker/docker-compose.yaml")
+        for image in ("woodpeckerci/woodpecker-server:v3.20.1", "woodpeckerci/woodpecker-agent:v3.20.1", "nginx:1.28-alpine"):
+            if not re.search(r"(?m)^\s*image:\s*[\"']?" + re.escape(image) + r"[\"']?\s*(?:#.*)?$", compose):
+                self.error("app/docker/docker-compose.yaml", "missing pinned image: " + image)
+
+    def run(self):
+        self.required()
+        self.manifest()
+        self.resources()
+        self.icons()
+        self.sources()
+        if self.errors:
+            for error in self.errors:
+                print("ERROR: " + error, file=sys.stderr)
+            print("Package validation failed (" + str(len(self.errors)) + " checks).", file=sys.stderr)
+            return 1
+        print("Package static validation passed: " + str(self.root))
+        print("No Docker daemon used; NAS deployment and end-to-end CI remain separate checks.")
+        return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("package_directory", nargs="?", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "packaging/woodpecker")
+    args = parser.parse_args()
+    if not args.package_directory.is_dir():
+        parser.error("package directory does not exist")
+    return Validator(args.package_directory.resolve()).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

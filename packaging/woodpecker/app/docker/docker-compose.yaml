@@ -1,0 +1,100 @@
+services:
+  initialize:
+    image: nginx:1.28-alpine
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        test -z "$$(find /state/server /state/agent -type l -print -quit)"
+        chown -R 1000:1000 /state/server
+        chmod 0700 /state/server
+        chown -R 0:0 /state/agent
+        chmod 0700 /state/agent
+    volumes:
+      - ${TRIM_PKGVAR}/server:/state/server
+      - ${TRIM_PKGVAR}/agent:/state/agent
+    network_mode: none
+    restart: "no"
+    labels: &configuration
+      io.fnos.woodpecker.config: unconfigured
+    mem_limit: 64m
+    cpus: 0.25
+
+  server:
+    image: woodpeckerci/woodpecker-server:v3.20.1
+    container_name: woodpecker-server
+    restart: "no"
+    labels: *configuration
+    env_file:
+      - path: ${TRIM_PKGETC}/current/server.env
+        format: raw
+    volumes:
+      - ${TRIM_PKGVAR}/server:/var/lib/woodpecker
+    networks: [control]
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+    mem_limit: 512m
+    cpus: 0.5
+    stop_grace_period: 30s
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  agent:
+    image: woodpeckerci/woodpecker-agent:v3.20.1
+    container_name: woodpecker-agent
+    restart: "no"
+    labels: *configuration
+    env_file:
+      - path: ${TRIM_PKGETC}/current/agent.env
+        format: raw
+    volumes:
+      - ${TRIM_PKGVAR}/agent:/etc/woodpecker
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [control]
+    depends_on:
+      server:
+        condition: service_started
+    mem_limit: 256m
+    cpus: 0.5
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "/bin/woodpecker-agent", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *logging
+
+  gateway:
+    image: nginx:1.28-alpine
+    container_name: woodpecker-gateway
+    restart: "no"
+    labels: *configuration
+    entrypoint: ["/bin/sh", "/fn-target/scripts/gateway-entrypoint"]
+    volumes:
+      - ${TRIM_PKGETC}/current/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${TRIM_APPDEST}:/fn-target:ro
+      - ${TRIM_APPDEST}/run:/fn-target/run
+    ports:
+      - "127.0.0.1:18081:8081"
+    networks: [control]
+    depends_on:
+      server:
+        condition: service_started
+    mem_limit: 64m
+    cpus: 0.25
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -S -O /dev/null http://server:8000/app/woodpecker/api/healthz 2>&1 | grep -q 'HTTP/1.1 204'"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *logging
+
+networks:
+  control: {}

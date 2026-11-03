@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Exercise the installed gateway on the NAS without OAuth credentials or real repositories."""
+
+import argparse
+import grp
+import http.client
+import json
+from pathlib import Path
+import socket
+import stat
+import subprocess
+import sys
+
+
+PREFIX = "/app/woodpecker"
+
+
+class UnixConnection(http.client.HTTPConnection):
+    def __init__(self, path):
+        super().__init__("localhost", timeout=8)
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
+
+
+def request(connection, method, path, body=None):
+    try:
+        connection.request(method, path, body=body, headers={"Connection": "close"})
+        response = connection.getresponse()
+        return response.status, dict(response.getheaders()), response.read()
+    finally:
+        connection.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--socket", default="/var/apps/woodpecker/target/woodpecker.sock")
+    parser.add_argument("--callback-port", type=int, default=18081)
+    args = parser.parse_args()
+    results = []
+
+    def check(name, condition):
+        results.append({"check": name, "passed": bool(condition)})
+        if not condition:
+            print(json.dumps(results, indent=2))
+            raise SystemExit("NAS smoke check failed: " + name)
+
+    def unix(method, path, body=None):
+        return request(UnixConnection(args.socket), method, path, body)
+
+    def callback(method, path, body=None):
+        return request(http.client.HTTPConnection("127.0.0.1", args.callback_port, timeout=8),
+                       method, path, body)
+
+    status, headers, body = unix("GET", PREFIX + "/api/healthz")
+    check("server-health-is-204-empty", status == 204 and body == b"")
+    status, headers, body = unix("GET", PREFIX + "?probe=1")
+    check("bare-entry-preserves-query", status == 308 and headers.get("Location") == PREFIX + "/?probe=1")
+    status, _, _ = unix("POST", PREFIX)
+    check("bare-entry-does-not-redirect-post", status == 405)
+    status, _, body = unix("GET", PREFIX + "/")
+    check("ui-html-is-served", status == 200 and b"<html" in body.lower())
+    check("ui-has-no-build-placeholder", b"/BASE_PATH" not in body)
+    status, _, _ = unix("GET", "/api/healthz")
+    check("root-api-not-published", status == 404)
+    status, _, _ = callback("POST", PREFIX + "/api/hook", "{}")
+    check("webhook-rejects-missing-token", status == 400)
+    status, _, _ = callback("POST", PREFIX + "/api/hook?access_token=invalid-smoke-token", "{}")
+    check("webhook-rejects-invalid-token", status == 400)
+    status, _, _ = callback("GET", PREFIX + "/api/hook")
+    check("webhook-rejects-get", status == 404)
+    for path in ("/", PREFIX + "/", PREFIX + "/authorize", PREFIX + "/api/healthz",
+                 "//app/woodpecker/api/hook", "/app/woodpecker/api/hook/", "/app/woodpecker/api/%68ook"):
+        status, _, _ = callback("POST", path, "{}")
+        check("callback-denies-" + path, status == 404)
+    output = subprocess.run(["docker", "ps", "-q", "--filter", "label=com.docker.compose.project=woodpecker"],
+                            check=True, capture_output=True, text=True)
+    check("compose-has-running-services", len(output.stdout.split()) == 3)
+    for name, memory, cpus in (("woodpecker-server", 512 * 1024 ** 2, 500000000),
+                               ("woodpecker-agent", 256 * 1024 ** 2, 500000000),
+                               ("woodpecker-gateway", 64 * 1024 ** 2, 250000000)):
+        inspected = subprocess.run(["docker", "inspect", "--format",
+                                    "{{json .HostConfig}}", name],
+                                   check=True, capture_output=True, text=True)
+        config = json.loads(inspected.stdout)
+        check(name + "-memory-cpu", config["Memory"] == memory and config["NanoCpus"] == cpus)
+        bindings = config.get("PortBindings") or {}
+        if name == "woodpecker-gateway":
+            check("webhook-host-loopback-only", bindings == {
+                "8081/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(args.callback_port)}]})
+        else:
+            check(name + "-no-host-ports", not bindings)
+    check("socket-not-world-writable-directory", not (Path(args.socket).parent.stat().st_mode & 0o002))
+    socket_info = Path(args.socket).stat()
+    check("socket-only-host-gateway-group", stat.S_IMODE(socket_info.st_mode) == 0o660
+          and socket_info.st_uid == 0 and socket_info.st_gid == grp.getgrnam("www-data").gr_gid)
+    inspected = subprocess.run(["docker", "inspect", "--format", "{{json .Mounts}}", "woodpecker-gateway"],
+                               check=True, capture_output=True, text=True)
+    mounts = {mount["Destination"]: mount for mount in json.loads(inspected.stdout)}
+    check("gateway-code-mounted-readonly", mounts["/fn-target"]["RW"] is False)
+    check("gateway-socket-directory-writable", mounts["/fn-target/run"]["RW"] is True)
+    print(json.dumps({"passed": len(results), "checks": results,
+                      "not_covered": ["GitHub OAuth", "valid webhook", "pipeline execution",
+                                      "GitHub commit status", "external FN Connect browser session"]}, indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, http.client.HTTPException, subprocess.CalledProcessError, ValueError, KeyError):
+        sys.exit("NAS smoke test failed: check application state, permissions and connectivity")

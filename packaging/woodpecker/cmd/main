@@ -1,0 +1,9 @@
+#!/bin/sh
+# The application center exclusively owns docker-project start/stop.
+case "${1:-}" in
+    stop) exit 0 ;;
+    start) ;;
+    status) ;;
+    *) printf '%s\n' 'Usage: main {start|stop|status}' >&2; exit 1 ;;
+esac
+. "$(dirname -- "$0")/common"

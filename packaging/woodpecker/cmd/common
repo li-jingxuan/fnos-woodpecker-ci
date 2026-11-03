@@ -1,0 +1,158 @@
+#!/bin/sh
+# Root is used only to prepare package-owned roots before Compose validation.
+set -eu
+umask 077
+
+fail() {
+    printf '%s\n' "$1" >&2
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        printf '%s\n' "$1" >> "$TRIM_TEMP_LOGFILE"
+    fi
+    exit 1
+}
+
+command -v python3 >/dev/null 2>&1 || fail 'Woodpecker 需要可用的 python3；请安装运行环境后重试。'
+CMD_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+if [ "$(id -u)" = 0 ]; then
+    if [ "${1:-}" = install-init ]; then
+        python3 - <<'PY'
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+
+account = pwd.getpwnam("docker-woodpecker")
+for variable, category in (("TRIM_APPDEST", "@appcenter"), ("TRIM_PKGETC", "@appconf"),
+                           ("TRIM_PKGVAR", "@appdata")):
+    path = Path(os.environ[variable]).resolve()
+    if not re.fullmatch(r"/vol[0-9]+/" + category + r"/woodpecker", str(path)):
+        raise SystemExit("Woodpecker: unexpected application directory; initialization refused")
+    path.mkdir(mode=0o700, exist_ok=True)
+    if not stat.S_ISDIR(path.lstat().st_mode):
+        raise SystemExit("Woodpecker: application directory must be a real directory")
+    os.chown(path, account.pw_uid, account.pw_gid)
+    path.chmod(0o700 if variable == "TRIM_PKGETC" else 0o755)
+PY
+    fi
+    # fnOS reapplies root ownership after extraction. Restore access only within
+    # this application's private configuration tree before dropping privileges.
+    python3 - <<'PY'
+import os
+from pathlib import Path
+import pwd
+import re
+
+etc = Path(os.environ["TRIM_PKGETC"]).resolve()
+if not re.fullmatch(r"/vol[0-9]+/@appconf/woodpecker", str(etc)):
+    raise SystemExit("Woodpecker: unexpected private configuration directory")
+if etc.exists():
+    import stat
+    account = pwd.getpwnam("docker-woodpecker")
+    def repair(fd):
+        os.fchown(fd, account.pw_uid, account.pw_gid)
+        for name in os.listdir(fd):
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            except OSError:
+                if stat.S_ISLNK(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                    continue
+                raise
+            try:
+                info = os.fstat(child)
+                if stat.S_ISDIR(info.st_mode):
+                    repair(child)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    os.fchown(child, account.pw_uid, account.pw_gid)
+                else:
+                    raise SystemExit("Woodpecker: unexpected private configuration object")
+            finally:
+                os.close(child)
+    fd = os.open(etc, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        repair(fd)
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+PY
+    # Only the runtime socket directory is writable inside the gateway container.
+    python3 - <<'PY'
+import os
+from pathlib import Path
+import grp
+import re
+import stat
+
+target = Path(os.environ["TRIM_APPDEST"]).resolve()
+if not re.fullmatch(r"/vol[0-9]+/@appcenter/woodpecker", str(target)):
+    raise SystemExit("Woodpecker: unexpected application target")
+run = target / "run"
+run.mkdir(mode=0o750, exist_ok=True)
+if not stat.S_ISDIR(run.lstat().st_mode):
+    raise SystemExit("Woodpecker: socket directory must be a real directory")
+gateway_gid = grp.getgrnam("www-data").gr_gid
+os.chown(run, 0, gateway_gid)
+run.chmod(0o750)
+gid_file = run / "gateway-gid"
+descriptor = os.open(gid_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+with os.fdopen(descriptor, "w") as handle:
+    handle.write(str(gateway_gid) + "\n")
+    os.fchmod(handle.fileno(), 0o644)
+link = target / "woodpecker.sock"
+if link.is_symlink():
+    if os.readlink(link) != "run/woodpecker.sock":
+        raise SystemExit("Woodpecker: unexpected socket link")
+elif not os.path.lexists(link):
+    link.symlink_to("run/woodpecker.sock")
+elif stat.S_ISSOCK(link.lstat().st_mode):
+    # Migration from the initial test package; the gateway must already be stopped.
+    import socket
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        probe.connect(str(link))
+    except ConnectionRefusedError:
+        link.unlink()
+        link.symlink_to("run/woodpecker.sock")
+    else:
+        raise SystemExit("Woodpecker: stop the gateway before socket migration")
+    finally:
+        probe.close()
+else:
+    raise SystemExit("Woodpecker: socket path occupied")
+PY
+    runuser -u docker-woodpecker -G AppUsers -G www-data -G docker-woodpecker -- python3 "$CMD_DIR/configure" "$@"
+    case "${1:-}" in
+        install-init|install|config|upgrade)
+            # A changed model label forces App Center's next compose up to recreate
+            # all services, refreshing env_file and single-file bind mounts.
+            python3 - <<'PY'
+import os
+from pathlib import Path
+import re
+import tempfile
+
+target = Path(os.environ["TRIM_APPDEST"]).resolve()
+etc = Path(os.environ["TRIM_PKGETC"]).resolve()
+revision = Path(os.readlink(etc / "current")).name
+if not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}", revision):
+    raise SystemExit("Woodpecker: invalid configuration revision")
+model = target / "docker/docker-compose.yaml"
+if model.exists():
+    text, count = re.subn(r"(?m)^      io\.fnos\.woodpecker\.config: [A-Za-z0-9-]+$",
+                         "      io.fnos.woodpecker.config: " + revision, model.read_text())
+    if count != 1:
+        raise SystemExit("Woodpecker: missing configuration revision label")
+    fd, temporary = tempfile.mkstemp(prefix=".compose-", dir=model.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            os.fchmod(handle.fileno(), 0o644)
+        os.replace(temporary, model)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+PY
+            ;;
+    esac
+    exit 0
+fi
+exec python3 "$CMD_DIR/configure" "$@"

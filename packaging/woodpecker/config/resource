@@ -1,0 +1,7 @@
+{
+  "docker-project": {
+    "projects": [
+      {"name": "woodpecker", "path": "docker"}
+    ]
+  }
+}

@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Private lifecycle adapter for runtime.py, without Docker or privilege escalation.
+
+Existing installs require a fresh stopped-task/cold-backup maintenance record
+before upgrade/uninstall. A stopped gateway alone is not proof that task
+containers have exited. No callback removes persistent data or stale sockets.
+"""
+
+import errno
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+MIN_FREE = 20 * 1024 ** 3
+FIELDS = ("page_origin", "webhook_origin", "github_admin", "github_client", "github_secret")
+MAINTENANCE = (
+    "请先停止接收新任务，等待或通过 Woodpecker 支持的接口明确取消任务，"
+    "确认本应用构建容器和临时网络已退出，再通过应用中心停止应用。"
+    "停止 Agent 不保证任务容器已退出；不要执行全局 prune。"
+)
+APPLY = (
+    "配置已生成，首次安装时由应用中心创建容器。"
+    "目标平台普通停止/启动会复用容器，后续修改须使用经过验证的包重装及冷备恢复流程。"
+    "修改地址后还需同步 GitHub OAuth callback 与既有仓库 Webhook。"
+)
+
+
+class LifecycleError(ValueError):
+    pass
+
+
+def report(message, *, error=False):
+    text = "Woodpecker: " + message
+    print(text, file=sys.stderr if error else sys.stdout)
+    logfile = os.environ.get("TRIM_TEMP_LOGFILE")
+    if logfile:
+        try:
+            with open(logfile, "a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+        except OSError:
+            pass
+
+
+def app_path(name):
+    value = os.environ.get(name, "")
+    path = Path(value)
+    if not value or not path.is_absolute() or ".." in path.parts:
+        raise LifecycleError(name + " 必须是本应用的绝对目录路径。")
+    path = path.resolve()
+    if path == Path("/"):
+        raise LifecycleError(name + " 不能是根目录。")
+    return path
+
+
+def paths():
+    result = tuple(app_path(name) for name in ("TRIM_APPDEST", "TRIM_PKGETC", "TRIM_PKGVAR"))
+    for index, path in enumerate(result):
+        for other in result[index + 1:]:
+            if path == other or path in other.parents or other in path.parents:
+                raise LifecycleError("本应用 target、etc、var 必须是相互独立的目录。")
+    return result
+
+
+def runtime_path(target):
+    script = target / "scripts" / "runtime.py"
+    # install_init may run before target is populated.
+    if not script.is_file():
+        script = Path(__file__).resolve().parent.parent / "app" / "scripts" / "runtime.py"
+    if not script.is_file():
+        script = Path(__file__).resolve().parent / "bootstrap" / "runtime.py"
+    if not script.is_file():
+        raise LifecycleError("找不到本应用 scripts/runtime.py，无法安全生成或检查配置。")
+    return script
+
+
+def stopped(target):
+    """Any live socket, unhealthy gateway included, prevents changing configuration."""
+    endpoint = target / "woodpecker.sock"
+    if endpoint.is_symlink():
+        if os.readlink(endpoint) != "run/woodpecker.sock":
+            raise LifecycleError("本应用 Socket 链接目标异常。")
+        endpoint = target / "run/woodpecker.sock"
+    try:
+        info = endpoint.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(info.st_mode):
+        raise LifecycleError("本应用 woodpecker.sock 不是 Unix socket；请人工检查，不会删除此文件。")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(2)
+        try:
+            probe.connect(str(endpoint))
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ECONNREFUSED):
+                return
+            raise LifecycleError("无法可靠判断应用是否停止（socket 不可访问或探测超时）。" + MAINTENANCE) from None
+    raise LifecycleError("应用仍在运行。必须先通过应用中心停止应用后再修改配置或维护。" + MAINTENANCE)
+
+
+def existing(etc):
+    return os.path.lexists(etc / "current")
+
+
+def directory(path, *, private=False):
+    """Create only our own directories; never change data directory ownership."""
+    path.mkdir(mode=0o700 if private else 0o755, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise LifecycleError("本应用目录必须是真实目录，不能包含目录软链接。")
+    if private:
+        if info.st_uid != os.geteuid():
+            raise LifecycleError("etc 目录必须属于当前包用户；请由应用中心修复目录归属。")
+        path.chmod(0o700)
+
+
+def nearest_existing(path):
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    if not path.is_dir():
+        raise LifecycleError("本应用目标目录或其父路径不是目录。")
+    return path
+
+
+def preflight(target, etc, var):
+    stopped(target)
+    for path in (target, etc, var):
+        parent = nearest_existing(path)
+        # install_init precedes app.tgz extraction and application-owned directory setup.
+        # The package user must not need write access to shared @appcenter/@appconf parents.
+        if shutil.disk_usage(parent).free < MIN_FREE:
+            raise LifecycleError("应用安装/配置/数据所在卷至少需要 20 GiB 可用空间。")
+    for child in (var / "server", var / "agent"):
+        if os.path.lexists(child) and not stat.S_ISDIR(child.lstat().st_mode):
+            raise LifecycleError("本应用 server/agent 数据路径冲突，必须是真实目录。")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", 18081))
+        except OSError:
+            raise LifecycleError("本机回调端口 127.0.0.1:18081 不可用；请先解决冲突，不会停止其他项目。") from None
+    report("安装预检查通过：本应用目录、20 GiB 空间、127.0.0.1:18081 与 Python CLI。"
+           "解包后的文件和目录写权限由安装回调验证；未调用 Docker。")
+
+
+def render(target, etc, var):
+    stopped(target)
+    directory(etc, private=True)
+    directory(var)
+    directory(var / "server")
+    directory(var / "agent")
+    data = {field: os.environ.get("wizard_" + field, "") for field in FIELDS}
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".wizard-", suffix=".json", dir=etc)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(data, handle, ensure_ascii=True)
+        # Never pass credentials in argv or print the input or generated env files.
+        completed = subprocess.run(
+            [sys.executable, str(runtime_path(target)), "configure", "--input", temporary,
+             "--etc", str(etc), "--var", str(var), "--target", str(target)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        if completed.returncode:
+            # runtime only emits sanitized errors; retain those useful field names.
+            message = completed.stderr.strip()
+            if message.startswith("runtime: ") and "\n" not in message:
+                raise LifecycleError("配置校验/生成失败：" + message)
+            raise LifecycleError("配置生成失败，请检查向导必填项、私密目录权限及 runtime 兼容性。")
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+    report(APPLY)
+
+
+def maintenance(target, etc, *, uninstall=False):
+    stopped(target)
+    if uninstall and os.environ.get("wizard_backup_confirmed") != "yes":
+        raise LifecycleError("卸载前必须确认已导出并验证独立于本应用目录的外部备份。"
+                             "平台实际删除语义尚未验证，不能承诺保留 etc/var。")
+    if existing(etc):
+        record = etc / ".maintenance.json"
+        try:
+            permit = json.loads(record.read_text(encoding="utf-8"))
+            revision = Path(os.readlink(etc / "current")).name
+            age = time.time() - permit["created"]
+            valid = (permit["operation"] == ("uninstall" if uninstall else "upgrade")
+                     and permit["revision"] == revision and permit["no_running_tasks"] is True
+                     and 0 <= age <= 900 and len(permit["backup_sha256"]) == 64)
+        except (OSError, ValueError, KeyError, TypeError):
+            valid = False
+        if not valid:
+            raise LifecycleError("请在应用停止后运行 scripts/backup-data 和 scripts/prepare-maintenance，"
+                                 "验证外部冷备及 Docker 任务已退出，再于 15 分钟内重试。" + MAINTENANCE)
+        record.unlink()
+
+
+def refresh(target, etc, var):
+    result = subprocess.run([sys.executable, str(runtime_path(target)), "metadata", "--etc", str(etc)],
+                            check=True, stdout=subprocess.PIPE, text=True)
+    metadata = json.loads(result.stdout)
+    for field in FIELDS:
+        os.environ["wizard_" + field] = metadata.get(field, "") if field != "github_secret" else ""
+    render(target, etc, var)
+
+
+def interrupted(signum, frame):
+    # Unwind render's finally so temporary credentials are removed on TERM/INT/HUP.
+    raise LifecycleError("生命周期回调被中断，未完成的操作请在维护窗口检查后重试。")
+
+
+def main():
+    os.umask(0o077)
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        signal.signal(getattr(signal, name), interrupted)
+    action = sys.argv[1] if len(sys.argv) == 2 else ""
+    try:
+        if action == "status":
+            target = app_path("TRIM_APPDEST")
+            return subprocess.run([sys.executable, str(runtime_path(target)), "status", "--socket",
+                                   str(target / "woodpecker.sock")]).returncode
+        target, etc, var = paths()
+        if action == "start":
+            # Starting again invalidates the stopped-instance proof, even with no tasks yet.
+            (etc / ".maintenance.json").unlink(missing_ok=True)
+        elif action == "install-init":
+            preflight(target, etc, var)
+            if not existing(etc):
+                render(target, etc, var)
+        elif action == "install":
+            stopped(target)
+            if existing(etc):
+                refresh(target, etc, var)
+                report("已按现有配置刷新模板，保留 OAuth 和 Agent 密钥；不会用安装向导覆盖。")
+            else:
+                render(target, etc, var)
+        elif action == "config-init":
+            stopped(target)
+            raise LifecycleError("此平台尚无已验证的配置重建入口，已阻止修改以保留当前配置。"
+                                 "请使用外部冷备和维护重装流程；停止/启动不会重新读取 env_file。")
+        elif action == "config":
+            raise LifecycleError("此平台尚无已验证的配置重建入口，已阻止修改以保留当前配置。"
+                                 "停止/启动不会重新读取 env_file。")
+        elif action in ("upgrade-init", "uninstall-init"):
+            maintenance(target, etc, uninstall=action.startswith("uninstall"))
+            report("检查通过；回调不删除本应用 var/etc。平台删除语义尚未验证，请保存外部备份。")
+        elif action == "uninstall":
+            report("卸载回调不主动删除数据；保留或删除由应用中心实际卸载语义决定，请保管外部备份。")
+        elif action == "upgrade":
+            stopped(target)
+            if not existing(etc):
+                raise LifecycleError("升级找不到 current 配置；拒绝用向导值重建或重置凭据，请先检查备份。")
+            # Re-render the new proxy template, retaining secrets through the public runtime interface.
+            refresh(target, etc, var)
+            report("升级已重新生成模板，保留 OAuth 与 Agent 密钥；启动时须由应用中心重建容器。")
+        else:
+            raise LifecycleError("未知生命周期操作。")
+        return 0
+    except LifecycleError as error:
+        report(str(error), error=True)
+    except (OSError, ValueError, UnicodeError, subprocess.CalledProcessError):
+        report("生命周期操作失败，请检查本应用目录权限、路径及 Python 运行环境。", error=True)
+    return 3 if action == "status" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

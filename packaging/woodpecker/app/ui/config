@@ -1,0 +1,15 @@
+{
+  ".url": {
+    "woodpecker.main": {
+      "title": "Woodpecker CI",
+      "icon": "images/icon_{0}.png",
+      "type": "url",
+      "protocol": "",
+      "gatewayPrefix": "/app/woodpecker",
+      "gatewaySocket": "woodpecker.sock",
+      "url": "/app/woodpecker",
+      "allUsers": false,
+      "control": {"accessPerm": "readonly"}
+    }
+  }
+}

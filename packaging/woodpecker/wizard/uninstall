@@ -1,0 +1,25 @@
+[
+  {
+    "stepTitle": "卸载前维护与备份确认",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "请先停止接收新任务，等待或明确取消任务，并确认本应用构建容器及临时网络退出，再通过应用中心停止应用。停止 Agent 不保证任务结束。当前尚未接入可靠任务检查，已有安装的自动卸载会被阻止，需要维护者完善检查后继续。"
+      },
+      {
+        "type": "tips",
+        "helpText": "必须先导出并验证独立于应用目录的外部备份，包含 SQLite 数据、OAuth/Agent 配置及 Agent 身份。平台卸载实际删除语义尚未验证，无法承诺保留 var/etc；此确认不代表自动备份已实现。回调不删除数据、不执行 prune。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_backup_confirmed",
+        "label": "已导出并验证应用目录外的备份",
+        "options": [
+          {"label": "尚未完成（阻止卸载）", "value": "no"},
+          {"label": "已完成并验证外部备份", "value": "yes"}
+        ],
+        "rules": [{"required": true, "message": "请确认外部备份状态"}]
+      }
+    ]
+  }
+]

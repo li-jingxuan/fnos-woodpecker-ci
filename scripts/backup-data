@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Create a private cold backup of a stopped Woodpecker FPK (run on the NAS)."""
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import subprocess
+import tarfile
+import tempfile
+
+
+MANIFEST = "backup-manifest.json"
+BLOCK = 1024 * 1024
+
+
+def digest(handle):
+    hasher = hashlib.sha256()
+    for block in iter(lambda: handle.read(BLOCK), b""):
+        hasher.update(block)
+    return hasher.hexdigest()
+
+
+def stopped():
+    for selector in ("label=com.docker.compose.project=woodpecker", "label=wp_uuid"):
+        result = subprocess.run(["docker", "ps", "-q", "--filter", selector],
+                                check=True, text=True, capture_output=True)
+        if result.stdout.strip():
+            raise ValueError("application or task containers are running")
+
+
+def revision_target(target):
+    if not re.fullmatch(r"revisions/[A-Za-z0-9][A-Za-z0-9_.-]*", target):
+        raise ValueError("invalid revision link")
+    return target.split("/")[1]
+
+
+def identity(root, etc, data):
+    # Bind the backup to resolved platform paths without disclosing them in the manifest.
+    return hashlib.sha256(json.dumps([str(root), str(etc), str(data)]).encode()).hexdigest()
+
+
+def fingerprint(info):
+    # Reading may update atime; all identity/content metadata must stay stable.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def snapshot(root, etc, data, destination=None):
+    """Hash real files, optionally copying those exact bytes into a private snapshot.
+
+    The caller compares a second pass and checks Docker before and after. The
+    maintenance permit is transient state, not application configuration or data.
+    """
+    selected = os.readlink(etc / "current")
+    revision = revision_target(selected)
+    records, directories = {}, []
+
+    def visit(source, name):
+        info = source.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                if fingerprint(os.fstat(descriptor)) != fingerprint(info):
+                    raise ValueError("source directory changed during backup")
+            finally:
+                os.close(descriptor)
+            directories.append(name)
+            if destination is not None:
+                (destination / name).mkdir(mode=0o700, parents=True, exist_ok=True)
+            for child in sorted(source.iterdir()):
+                if name == "etc" and child.name == ".maintenance.json":
+                    continue
+                visit(child, name + "/" + child.name)
+            if fingerprint(source.lstat()) != fingerprint(info):
+                raise ValueError("source directory changed during backup")
+        elif stat.S_ISLNK(info.st_mode):
+            if name != "etc/current" or os.readlink(source) != selected:
+                raise ValueError("unexpected source symlink")
+            if destination is not None:
+                (destination / name).symlink_to(selected)
+        elif stat.S_ISREG(info.st_mode):
+            descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if not stat.S_ISREG(before.st_mode) or fingerprint(before) != fingerprint(info):
+                    raise ValueError("source changed during backup")
+                hasher = hashlib.sha256()
+                copied = None
+                try:
+                    if destination is not None:
+                        copied = (destination / name).open("xb")
+                        os.fchmod(copied.fileno(), stat.S_IMODE(info.st_mode) & 0o700)
+                    for block in iter(lambda: handle.read(BLOCK), b""):
+                        hasher.update(block)
+                        if copied is not None:
+                            copied.write(block)
+                finally:
+                    if copied is not None:
+                        copied.close()
+                if (fingerprint(os.fstat(handle.fileno())) != fingerprint(before)
+                        or fingerprint(source.lstat()) != fingerprint(before)):
+                    raise ValueError("source changed during backup")
+                records[name] = {"sha256": hasher.hexdigest(), "size": before.st_size}
+        else:
+            raise ValueError("source contains a non-regular file")
+
+    for source, name in ((etc, "etc"), (data / "server", "var/server"),
+                         (data / "agent", "var/agent")):
+        if not stat.S_ISDIR(source.lstat().st_mode):
+            raise ValueError("source root must be a real directory")
+        visit(source, name)
+    if os.path.lexists(root / "manifest"):
+        if not stat.S_ISREG((root / "manifest").lstat().st_mode):
+            raise ValueError("invalid package manifest")
+        visit(root / "manifest", "manifest")
+    if ("etc/" + selected not in directories
+            or not any(name.startswith("etc/" + selected + "/") for name in records)
+            or not any(name.startswith("var/server/") and entry["size"] > 0
+                       for name, entry in records.items())):
+        raise ValueError("missing configuration or Server data")
+    if os.readlink(etc / "current") != selected:
+        raise ValueError("revision changed during backup")
+    return {"version": 1, "instance": identity(root, etc, data), "revision": revision,
+            "current": selected, "files": records, "directories": sorted(directories)}
+
+
+def safe_members(archive):
+    """Shared strict archive grammar, also used by the offline restore command."""
+    members, total = {}, 0
+    for member in archive:
+        raw = member.name.rstrip("/") if member.isdir() else member.name
+        name = PurePosixPath(raw)
+        if (not raw or name.is_absolute() or ".." in name.parts
+                or str(name) != raw or raw in members):
+            raise ValueError("unsafe or duplicate archive path")
+        if name.parts[0] not in ("etc", "var", "manifest", MANIFEST):
+            raise ValueError("unexpected archive root")
+        if name.parts[0] in ("manifest", MANIFEST) and (len(name.parts) != 1 or not member.isfile()):
+            raise ValueError("invalid manifest entry")
+        if name.parts[0] == "var" and (len(name.parts) == 1 and not member.isdir()
+                                      or len(name.parts) > 1 and name.parts[1] not in ("server", "agent")):
+            raise ValueError("unexpected data root")
+        if raw in ("etc", "var/server", "var/agent") and not member.isdir():
+            raise ValueError("invalid application directory")
+        if member.issym():
+            if raw != "etc/current":
+                raise ValueError("unexpected symlink")
+            revision_target(member.linkname)
+        elif not (member.isfile() or member.isdir()):
+            raise ValueError("unexpected archive entry type")
+        if member.size < 0 or not member.isfile() and member.size != 0:
+            raise ValueError("invalid archive entry size")
+        if raw == "etc/current" and not member.issym():
+            raise ValueError("invalid current link")
+        total += member.size
+        members[raw] = member
+        if total > 100 * 1024 ** 3 or len(members) > 100000:
+            raise ValueError("archive exceeds safety limits")
+    if not members:
+        raise ValueError("empty archive")
+    for name in members:
+        for parent in PurePosixPath(name).parents:
+            if str(parent) in members and not members[str(parent)].isdir():
+                raise ValueError("archive writes through a non-directory")
+    current = members.get("etc/current")
+    if current is not None:
+        target = members.get("etc/" + current.linkname)
+        if target is None or not target.isdir():
+            raise ValueError("missing revision target")
+    return members
+
+
+def archive_manifest(archive, members):
+    member = members.get(MANIFEST)
+    if member is None or not 0 < member.size <= 32 * BLOCK:
+        raise ValueError("missing backup manifest")
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate manifest field")
+            result[key] = value
+        return result
+
+    with archive.extractfile(member) as handle:
+        manifest = json.load(handle, object_pairs_hook=unique)
+    if (not isinstance(manifest, dict) or manifest.get("version") != 1
+            or set(manifest) != {"version", "instance", "revision", "current", "files", "directories"}
+            or not isinstance(manifest["instance"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest["instance"])
+            or not isinstance(manifest["current"], str)
+            or revision_target(manifest["current"]) != manifest["revision"]
+            or not isinstance(manifest["files"], dict)
+            or not isinstance(manifest["directories"], list)):
+        raise ValueError("invalid backup manifest")
+    files = {name for name, item in members.items() if item.isfile() and name != MANIFEST}
+    dirs = sorted(name for name, item in members.items() if item.isdir() and name != "var")
+    links = {name for name, item in members.items() if item.issym()}
+    if (files != set(manifest["files"]) or dirs != manifest["directories"]
+            or links != {"etc/current"}
+            or members["etc/current"].linkname != manifest["current"]
+            or not any(name.startswith("etc/" + manifest["current"] + "/") for name in files)
+            or not any(name.startswith("var/server/") and members[name].size > 0 for name in files)):
+        raise ValueError("backup manifest does not match archive")
+    for name in files:
+        record = manifest["files"][name]
+        if (not isinstance(record, dict) or set(record) != {"size", "sha256"}
+                or type(record["size"]) is not int or record["size"] != members[name].size):
+            raise ValueError("invalid file record")
+        with archive.extractfile(members[name]) as handle:
+            if digest(handle) != record["sha256"]:
+                raise ValueError("backup file digest mismatch")
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--app-root", default="/var/apps/woodpecker")
+    parser.add_argument("--output", required=True, help="new archive outside application directories")
+    args = parser.parse_args()
+    root = Path(args.app_root).resolve(strict=True)
+    output = Path(args.output).resolve()
+    etc = (root / "etc").resolve(strict=True)
+    data = (root / "var").resolve(strict=True)
+    if output == Path("/") or any(output.is_relative_to(path) for path in (root, etc, data)):
+        parser.error("backup must be outside the application and its data directories")
+    stopped()
+    if not (etc / "current").is_symlink() or not (data / "server").is_dir():
+        parser.error("expected an installed Woodpecker application")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output = output.parent.resolve(strict=True) / output.name
+    if any(output.is_relative_to(path) for path in (root, etc, data)):
+        parser.error("backup parent resolves inside application data")
+    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle, tempfile.TemporaryDirectory(
+                prefix=".woodpecker-snapshot-", dir=output.parent) as temporary:
+            stage = Path(temporary)
+            manifest = snapshot(root, etc, data, stage)
+            if snapshot(root, etc, data) != manifest:
+                raise ValueError("source changed during backup")
+            stopped()
+            with tarfile.open(fileobj=handle, mode="w:gz") as archive:
+                for name in ("etc", "var/server", "var/agent", "manifest"):
+                    if (stage / name).exists():
+                        archive.add(stage / name, arcname=name)
+                payload = json.dumps(manifest, sort_keys=True).encode("utf-8")
+                info = tarfile.TarInfo(MANIFEST)
+                info.mode, info.size = 0o600, len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+        print(json.dumps({"archive": str(output), "created": datetime.now(timezone.utc).isoformat(),
+                          "encrypted": False, "contains_credentials": True}))
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, subprocess.CalledProcessError, tarfile.TarError, ValueError):
+        raise SystemExit("backup failed; check permissions, application state and disk space")

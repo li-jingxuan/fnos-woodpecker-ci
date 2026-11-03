@@ -1,0 +1,3 @@
+#!/bin/sh
+set -- install-init
+. "$(dirname -- "$0")/common"
