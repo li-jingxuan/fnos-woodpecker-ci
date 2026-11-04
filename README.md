@@ -8,9 +8,11 @@
 
 `scripts/validate-package` 实现静态契约检查，`scripts/build-fpk` 实现临时 staging 打包与 SHA-256 产物输出。静态检查通过、FPK 生成成功、NAS 安装成功和完整 CI 成功是不同结果。静态检查不能证明 Docker 权限、飞牛调用时序、FN Connect、OAuth 或 Webhook 可用。
 
-**当前交付为基础链路测试版。** 本机 32 项测试及静态检查通过，NAS 已完成真实 FPK 安装、三服务运行、27 项基础检查、冷备与离线恢复；登录飞牛后可从桌面进入 Woodpecker 登录页。仍使用测试 OAuth 配置，不能登录 GitHub 或执行真实仓库构建。详见 [NAS 验证报告](docs/20261104_NAS部署验证报告.md)，按[技术方案](docs/20261103_Woodpecker飞牛应用部署技术方案.md)的 A01–A22 记录通过范围和缺项。
+**当前交付已通过真实 OAuth 与手动构建验证，自动 Webhook 链路仍待完成。** 本机 32 项测试及静态检查通过；NAS 完成真实 FPK 安装、27 项基础检查、冷备和离线恢复，并使用真实 GitHub 账号完成授权回跳。专用私有仓库的两次手动构建成功，故意失败构建返回退出码 17，GitHub 分别收到成功和失败状态；真实任务的 2 CPU / 1.5 GiB 限额已在内核 cgroup 核对。当前 FN Connect Webhook 投递返回 HTML，尚未证明外部 push 自动触发；Docker Hub 不可达时，测试仓库显式使用官方 Quay 克隆镜像。详见 [NAS 验证报告](docs/20261104_NAS部署验证报告.md)，按[技术方案](docs/20261103_Woodpecker飞牛应用部署技术方案.md)的 A01–A22 记录通过范围和缺项。
 
-目标平台普通停止/启动复用容器，**配置向导现已阻止修改**，避免文件更新而运行实例仍使用旧值。`install-fpk` 遇到已安装应用直接返回；`install-local` 在测试中执行卸载重装，且可能忽略卸载回调错误，不作为可靠的升级入口。生产使用前仍需验证平台支持的升级、配置重建和回退流程。
+目标平台普通停止/启动复用容器，**配置向导现已阻止修改**，避免文件更新而运行实例仍使用旧值。本次在冷备后人工执行本项目的 Compose 容器重建，再交由应用中心启动，已验证真实 OAuth 配置生效；该维护过程尚未接入配置向导或完成真实失败回退验收。`install-fpk` 遇到已安装应用直接返回；`install-local` 在测试中执行卸载重装，且可能忽略卸载回调错误，不作为可靠的升级入口。生产使用前仍需验证平台支持的升级和回退流程。
+
+实际项目 `li-jingxuan/liuxianmao` 的 `openchamber/pindou` 分支已通过完整流水线验证：后端 261 项测试、前端 172 项测试和生产构建全部成功。支持通过 `BUILD_TARGET=api/web/all` 单独选择任务；PostgreSQL 仅用官方镜像提供临时后端测试数据库。自定义源码下载已改为普通步骤，最新第 10 次任务无解析警告。详见[完整构建报告](docs/20261104_Pindou流水线验证.md)及[单独构建与警告修复记录](docs/20261104_Pindou单独构建验证.md)。最新 OAuth 登录复测再次遇到 NAS 到 GitHub 的连接超时；FN Connect 公网 Webhook 也仍未打通，本机通知投递成功不能替代公网自动触发验收。
 
 ## 源码与离线检查
 
@@ -64,6 +66,8 @@ Agent 通过宿主 Docker socket 运行任务，该权限接近宿主管理权�
 4. 向导填写页面 origin、单个 GitHub 管理员用户名、Client ID 和 Client Secret，以及适用的 Webhook 地址配置。origin 填协议和主机名（可含端口），不填写 `/app/woodpecker`、查询参数、fragment 或 URL 用户密码；程序统一追加固定前缀。GitHub 管理员用户名与飞牛账号分别配置。
 
 `WOODPECKER_HOST` 最终为无末尾斜杠的完整页面基址，正常首页是 `/app/woodpecker/`。Agent 共享密钥由安装流程随机生成，不需要在 GitHub 创建。配置模块支持空白 OAuth Secret 保留旧值，但当前平台配置向导被阻止；替换或轮换必须先验证容器重建入口。飞牛登录和 GitHub 登录是两套身份验证，桌面入口可见不代表已经获得仓库权限。
+
+本包以 GitHub 作为仓库平台，Woodpecker 使用 GitHub OAuth 确认用户身份并取得其仓库权限；飞牛账号仅控制进入 NAS，不能替代这一步。登录卡在 Loading 时，还需检查 NAS 到 `github.com/login/oauth/access_token` 的出站连接：浏览器能打开 GitHub、`api.github.com` 可达或服务 healthcheck 正常，都不能证明 Server 能完成令牌交换。排查日志时不要输出 OAuth code、令牌或 Secret。
 
 ## Webhook 接入
 
